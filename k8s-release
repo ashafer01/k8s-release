@@ -1,0 +1,332 @@
+#!/bin/bash
+#
+# k8s-release Repeatable deployment tool for static Kubernetes manifest files
+#
+# Copyright 2020 ashafer01
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy of
+# this software and associated documentation files (the "Software"), to deal in
+# the Software without restriction, including without limitation the rights to
+# use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
+# of the Software, and to permit persons to whom the Software is furnished to do
+# so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+version="0.1.0"
+
+help_heading() {
+    echo "k8s-release $version -- Repeatable Kubernetes deployment tool"
+    echo 'https://github.com/ashafer01/k8s-release'
+}
+
+usage() {
+    echo 'Usage:'
+    echo '   k8s-release init     -- Set up a new release of a set of Kubernetes'
+    echo '                           manifest files (interactive)'
+    echo '   k8s-release upgrade  -- Download latest versions of remote'
+    echo '                           manifest files and re-render (unattended)'
+    echo '   k8s-release refresh  -- Render the release taking in updates to'
+    echo '                           kustomizations (unattended)'
+    echo '   k8s-release apply    -- Use kubectl to deploy the release (unattended)'
+    echo
+    echo 'Informational:'
+    echo '   k8s-release help     -- Full help output'
+    echo '   k8s-release usage    -- Just output this usage table'
+    echo '   k8s-release version  -- Check deps and print the version'
+}
+
+manifest_fn="manifest-urls"
+release_dir=".release"
+upstream_dir="$release_dir/upstream"
+release_fn="$release_dir/release.yaml"
+kustomize_fn="kustomization.yaml"
+
+# set up debugging handle initially redirected to null
+exec 3>/dev/null
+
+if [[ -n "$DEBUG" ]]; then
+    # redirect debugging handle to stderr so the user can see it
+    exec 3>&2
+fi
+
+error() {
+    echo "$1" >&2
+}
+
+check() {
+    [[ $1 -ne 0 ]] && error "$2" && exit 1
+}
+
+# https://stackoverflow.com/a/3352015/94077
+trim() {
+    local var="$1"
+    var="${var#"${var%%[![:space:]]*}"}"
+    var="${var%"${var##*[![:space:]]}"}"   
+    echo -n "$var"
+}
+
+write_kustomize_header() {
+cat <<EOT > "$1"
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+EOT
+return $?
+}
+
+fetch_manifest_urls() {
+    rm -rf "$upstream_dir"
+    mkdir -p "$release_dir"
+    mkdir "$upstream_dir"
+    check $? "Failed to create directory $upstream_dir"
+    manifest_urls="$(cat $manifest_fn)"
+    pushd "$upstream_dir"
+    echo "$manifest_urls" | while read line; do
+        args="$(trim "$line")"
+        if [[ -z "$args" ]] || [[ "$args" =~ ^# ]]; then
+            continue
+        fi
+        eval wget $args
+    done
+    find . -name '*.tar.gz' -exec tar -xzvf {} \; -delete
+    find . -name '*.tar.bz2' -exec tar -xjvf {} \; -delete
+    yaml_files="$(find . \( -name '*.yaml' -or -name '*.yml' \) -exec echo '- "{}"' \;)"
+    popd
+    if [[ -z "$yaml_files" ]]; then
+        error "No yaml/yml files downloaded from manifest-urls"
+        exit 1
+    fi
+    write_kustomize_header "$upstream_dir/$kustomize_fn"
+    check $? "Failed to initialize upstream $kustomize_fn"
+    echo "$yaml_files" >> "$upstream_dir/$kustomize_fn"
+    check $? "Failed writing upstream $kustomize_fn resource list"
+}
+
+render_release() {
+    compgen -G 'kustomization.y*ml' >/dev/null
+    if [[ $? -eq 0 ]]; then
+        echo 'Applying kustomization ...'
+        kustomize build \
+            --reorder "legacy" \
+          > "$release_fn"
+        check $? 'Failed to render kustomization'
+        echo 'Successfully rendered kustomization'
+    else
+        error "No $kustomize_fn found"
+        exit 1
+    fi
+
+    echo
+    echo "Release has been rendered in $release_fn"
+    echo 'Deploy it to the cluster by running:'
+    echo
+    echo "     kubectl apply -f $release_fn"
+    echo 'OR'
+    echo '     k8s-release apply'
+    echo
+    echo 'Enjoy!'
+}
+
+write_manifest_urls_template() {
+cat <<EOT > "$manifest_fn"
+# This directory is managed by:
+# https://github.com/ashafer01/k8s-release
+
+# List URLs to remote Kubernetes manifest files, one per line
+# Whitespace at the start and end of the line will be trimmed
+# You can add your own comments like this one too
+EOT
+return $?
+}
+
+write_kustomize_template() {
+write_kustomize_header "$kustomize_fn"
+[[ $? -ne 0 ]] && return $?
+cat <<EOT >> "$kustomize_fn"
+# This directory contains all of the unmodified upstream files along
+# with a no-op kustomization.yaml including all of them as resources
+- $upstream_dir
+# Any local files should be manually listed here
+
+# Add transformers/generators here
+# https://github.com/kubernetes-sigs/kustomize/blob/master/docs/fields.md
+EOT
+return $?
+}
+
+check_editor() {
+    if [[ -z "$EDITOR" ]]; then
+        error "EDITOR environment variable must be set and refer to an executable file"
+        exit 1
+    fi
+    if [[ ! -x "$EDITOR" ]]; then
+        error "EDITOR environment variable ($EDITOR) does not exist or is not executable"
+        exit 1
+    fi
+    echo "EDITOR $EDITOR seems valid" >&3
+}
+
+check_deps() {
+    have_all_deps="yes"
+
+    echo -n 'Checking wget: ' >&3
+    which wget >&3 2>&3
+    if [[ $? -ne 0 ]]; then
+        error 'Command wget not found on PATH'
+        error '   `brew/apt/yum/... install wget` will usually work'
+        have_all_deps="no"
+    fi
+
+    echo -n 'Checking kustomize: ' >&3
+    which kustomize >&3 2>&3
+    if [[ $? -ne 0 ]]; then
+        error 'Command kustomize not found on PATH'
+        error '   `brew install kustomize` or check:'
+        error '   https://github.com/kubernetes-sigs/kustomize/blob/master/docs/INSTALL.md'
+        have_all_deps="no"
+    fi
+
+    echo -n 'Checking kubectl: ' >&3
+    which kubectl >&3 2>&3
+    if [[ $? -ne 0 ]]; then
+        error 'Command kubectl not found on PATH'
+        error '   `brew install kubectl` or check:'
+        error '   https://kubernetes.io/docs/tasks/tools/install-kubectl/'
+        have_all_deps="no"
+    fi
+
+    if [[ "$have_all_deps" == "no" ]]; then
+        error 'Cannot continue without above commands available on the PATH'
+        exit 1
+    fi
+}
+
+case "$1" in
+"init")
+    check_deps
+    check_editor
+
+    if [[ -e "$manifest_fn" ]]; then
+        echo "$manifest_fn file already exists, leaving it alone"
+    else
+        # Set up initial manifest-urls template file
+        write_manifest_urls_template
+        check $? "Failed to write $manifest_fn template"
+        echo "Wrote out initial template $manifest_fn file"
+        echo "Opening with $EDITOR"
+        "$EDITOR" "$manifest_fn"
+        check $? "$EDITOR exited non-zero"
+    fi
+
+    fetch_manifest_urls
+
+    # Write a kustomize template
+    compgen -G 'kustomization.y*ml' >/dev/null
+    if [[ $? -ne 0 ]]; then
+        write_kustomize_template
+        check $? 'Failed to write kustomize template file'
+        echo "Wrote $kustomize_fn for optional modification"
+        echo -n "Would you like to edit $kustomize_fn now? "
+        read prompt
+        if [[ "$prompt" =~ ^[yY] ]]; then
+            echo "Opening with $EDITOR"
+            "$EDITOR" "$kustomize_file"
+            check $? "$EDITOR exited non-zero"
+        else
+            echo "We'll leave the no-op kustomize in place"
+        fi
+    else
+        echo "A kustomization already exists in this directory: $(echo kustomization.y*ml)"
+    fi
+
+    render_release
+    ;;
+"upgrade")
+    check_deps
+    mv "$release_dir" "$release_dir-old"
+    check $? 'Failed to stash previous release'
+    fetch_manifest_urls
+    render_release
+    rm -rf "$release_dir-old"
+    ;;
+"refresh")
+    check_deps
+    render_release
+    ;;
+"apply")
+    check_deps
+    kubectl apply -f "$release_fn"
+    ;;
+"version")
+    echo "v$version -- k8s-release Development"
+    echo >&3
+    check_deps
+    ;;
+"help")
+    help_heading
+    echo
+    usage
+    echo
+    echo 'Help topics:'
+    echo
+    echo '* Debugging'
+    echo
+    echo 'Set the DEBUG variable to get extra debugging output, e.g.:'
+    echo
+    echo '   DEBUG=yes k8s-release version'
+    echo
+    echo '* Interactive editor'
+    echo
+    echo 'Note that the `init` subcommand makes frequent use of the'
+    echo "standard EDITOR environment variable. If you don't keep this"
+    echo 'set in your shell rc file, you can pass it in, e.g.:'
+    echo
+    echo '   EDITOR=/usr/bin/vim DEBUG=yes k8s-release init'
+    echo
+    echo 'The editor that k8s-release opens must be closed after you'
+    echo 'are finished editing the file for the init process to'
+    echo 'continue.'
+    echo
+    echo '* Re-init'
+    echo
+    echo 'The init command is idempotent. It will non-destructively'
+    echo 'ensure that all required files are in place, skipping over'
+    echo 'any that are already present. Note that init cannot'
+    echo 'validate files beyond their presence.'
+    echo
+    echo '* Dependencies'
+    echo
+    echo 'k8s-release expects all of the following commands to be'
+    echo 'available on the PATH:'
+    echo '  - wget'
+    echo '  - kustomize'
+    echo '  - kubectl'
+    echo
+    echo 'Homebrew users can install all of these with:'
+    echo
+    echo '   brew install wget kustomize kubectl'
+    echo
+    echo 'Other platforms will have different setup needs.'
+    echo 'k8s-release checks for missing dependencies and will'
+    echo 'output a link with installation instructions.'
+    ;;
+"usage")
+    usage
+    ;;
+*)
+    help_heading
+    echo
+    error 'Unknown subcommand, see `k8s-release help` for more info'
+    exit 1
+    ;;
+esac
